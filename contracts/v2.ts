@@ -1,0 +1,127 @@
+/** Public transport vocabulary. No database rows or unfiltered engine state belong here. */
+import type { RoleId, RulesetConfig } from '../rulesets/types.ts';
+
+export const CONTRACT_VERSION = '2.2' as const;
+export const COMMAND_ACTIONS = ['SUBMIT_GUARD', 'SUBMIT_LAIKE', 'EDIT_PROPOSAL', 'CONFIRM_PROPOSAL', 'SUBMIT_CHECK', 'SUBMIT_RESCUE', 'SUBMIT_REVIVE', 'REGISTER_CANDIDACY', 'WITHDRAW_CANDIDACY', 'START_SPEECH', 'END_ELECTION_SPEECH', 'SUBMIT_ELECTION_VOTE', 'DESIGNATE_SPEECH', 'END_SPEECH', 'SUBMIT_DAY_VOTE', 'END_TIE_SPEECH', 'END_LAST_WORDS', 'SUBMIT_HANDOVER'] as const;
+export type CommandAction = typeof COMMAND_ACTIONS[number];
+export type RoomPhase = 'lobby' | 'playing' | 'review';
+/**
+ * 公屏写权限档位（建房时由房主显式选择，无默认值）：
+ * - `alive_only`：对局内所有阶段仅存活正式玩家可写；死者只读（本人遗言窗口除外，R-45）。
+ * - `everyone`：对局内所有阶段存活与死者均可写。
+ * 观众与第二屏在任何档位下都只读。对局外（大厅/复盘）不适用，复盘按 R-53 只读归档。
+ */
+export const PUBLIC_CHAT_MODES = ['alive_only', 'everyone'] as const;
+export type PublicChatMode = typeof PUBLIC_CHAT_MODES[number];
+export type MemberKind = 'formal' | 'public_spectator' | 'private_spectator';
+export type Presence = 'online' | 'reconnecting' | 'offline';
+export interface Profile { userId: string; uid: string; nickname: string; avatarUrl: string | null; profileVersion: number }
+export interface AuthMe extends Profile { expiresAt: number }
+export interface RoomMemberDTO extends Profile {
+  memberId: string;
+  kind: MemberKind;
+  playerId: string | null;
+  ready: boolean | null;
+  presence: Presence;
+  joinedAt: number;
+  isHost: boolean;
+}
+export interface Permission { allowed: boolean; reason: string | null }
+export type ControlReason = 'kicked' | 'dissolved' | 'taken_over' | 'session_expired' | 'account_disabled' | 'host_changed' | 'review_ended' | 'left' | 'screen_revoked';
+export interface ControlNotice { roomId: string; gameId: string | null; reason: ControlReason }
+export interface RequestIntent { requestId: string }
+export interface MatchIntent extends RequestIntent { gameId: string }
+export interface VoiceCredentials { appId: string; channel: string; uid: number; token: string }
+export interface VoiceSyncResult { synced: true }
+export interface CommandIntent extends MatchIntent { windowInstanceId: string; action: CommandAction; targets?: string[]; revision?: number; direction?: 'asc' | 'desc'; confirmSelf?: true; expectedRevision?: number }
+export interface CommandReceipt {
+  requestId: string;
+  status: 'accepted' | 'rejected';
+  code: string | null;
+  message: string | null;
+}
+export type ReceiptLookup = CommandReceipt | { requestId: string; status: 'not_seen' | 'pending' };
+export interface ChatMessageDTO { messageId: string; clientMessageId: string; cursor: number; senderId: string; text: string; at: number }
+export interface ErrorEnvelope { error: { code: string; message?: string } }
+
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+export interface EventDTO { cursor: number; type: string; dayNumber: number; stage: 1 | 2; payload: JsonValue }
+export interface WindowDTO { id: string; type: string; instanceId: string; closesAt: number }
+export interface TargetSelection { playerIds: string[]; maxTargets: number; allowRepeated: boolean; canSkip: boolean; forbiddenPairs: string[][] }
+export interface SubmissionDTO { action: CommandAction; windowInstanceId: string; requestId: string | null; acceptedAt: number; targets: string[]; revision: number | null; direction: 'asc' | 'desc' | null }
+export interface TaskDTO { action: CommandAction; windowInstanceId: string; closesAt: number; targets: TargetSelection | null }
+export interface SeatDTO extends Profile { playerId: string; memberId: string | null; seat: number; alive: boolean; revealedRoleId: RoleId | null; presence: Presence | 'left'; isHost: boolean }
+export interface SelfDTO {
+  playerId: string; seat: number; nickname: string; roleId: RoleId; life: 'alive' | 'dying' | 'dead'; revealed: boolean; voteFrozen: boolean;
+  abilities: { laikeBladeUsed: boolean; waterRescueUsed: boolean };
+  guardHistory: readonly { nightNumber: number; targetPlayerIds: readonly string[] }[];
+}
+export interface DayDTO {
+  step: 'morning_announcement' | 'first_night_last_words' | 'election' | 'speech_round' | 'free_speech' | 'vote' | 'elimination_last_words' | 'handover' | 'settle';
+  speechPreparing: boolean;
+  currentSpeakerId: string | null;
+  election: { phase: 'signup' | 'speech' | 'vote' | 'revote' | 'done'; candidates: readonly string[]; withdrawn: readonly string[]; speechOrder: readonly string[]; round: 1 | 2; votedCount: number; eligibleCount: number; tiedIds: readonly string[]; winnerId: string | null } | null;
+  ballot: { phase: 'vote' | 'tie_speech' | 'revote' | 'done'; round: 1 | 2; votedCount: number; eligibleCount: number; tiedIds: readonly string[]; eliminatedId: string | null } | null;
+  speechRound: { order: readonly string[]; index: number; designatedBy: string | null; startSeat: number; direction: 'asc' | 'desc' } | null;
+  lastWords: { queue: readonly string[]; index: number } | null;
+  handover: { deadSheriffId: string; resolved: boolean; heirId: string | null } | null;
+}
+export interface PublicGameDTO {
+  phase: 'night' | 'morning' | 'day' | 'ended'; dayNumber: number; stage: 1 | 2;
+  sheriff: { enabled: boolean; holderId: string | null };
+  seats: SeatDTO[]; events: EventDTO[]; day: DayDTO | null;
+  night: { closesAt: number } | null;
+  result: { winner: 'human' | 'death_faction'; dayNumber: number; reason: string } | null;
+  startedAt: number; endedAt: number | null;
+}
+export interface PrivateGameDTO {
+  self: SelfDTO; events: EventDTO[];
+  factionRoom: { roomId: string; readOnly: boolean; canWrite: boolean; members: readonly { playerId: string; seat: number; readOnly: boolean }[] } | null;
+  targets: Partial<Record<CommandAction, TargetSelection>>;
+  /**
+   * 私人身份知识（按角色/阶段/技能状态授权，服务端先裁剪）：
+   * - `spiritSeats`：死神/丧亲者→全部魂灵，魂灵→其他魂灵，其余空；
+   * - `dyingSeats`（可选）：本夜濒死名单，仅一阶段、夜间、已产生名单时下发给
+   *   未死亡的降临者与未死亡且未使用还魂曲的水妖；其余情况**不含该字段**（不得下发空数组冒充"无名单"）。
+   */
+  knowledge: { spiritSeats: number[]; dyingSeats?: number[] };
+  proposal: { pool: 'death' | 'spirit' | 'joint'; activeMemberIds: readonly string[]; revision: number; targetPlayerIds: readonly string[]; confirmedBy: readonly string[]; locked: boolean; effective: { revision: number | null; targetPlayerIds: readonly string[]; basis: 'unanimous' | 'latest_legal' | 'empty' } } | null;
+  /** 当前发言窗口的送达回执聚合；仅对「此刻持有发布权」的人下发，其他人不含该字段（可选，向后兼容）。 */
+  voice?: { delivery: VoiceDeliveryDTO } | null;
+}
+/** 送达回执聚合：分母是「上报过的接收端数」，不是频道人数（措辞与隐私边界见 docs/frontend-v2-voice.md）。 */
+export interface VoiceDeliveryDTO {
+  windowInstanceId: string; delivered: number; blocked: number; silentOutput: number; failed: number; listeners: number; updatedAt: number;
+}
+export type RoomAction = 'ready' | 'start' | 'promote' | 'leave' | 'transferHost' | 'dissolve' | 'endReview' | 'kickFormal' | 'kickSpectator' | 'inviteSecondScreen' | 'revokeSecondScreen';
+export interface SnapshotCapabilities {
+  canPostPublic: boolean; canPostFaction: boolean; canPublishVoice: boolean; canVote: boolean;
+  supportsProposalEditConfirmation?: boolean;
+  allowedCommands: CommandAction[];
+  commandReasons: Record<CommandAction, string | null>;
+  room: Record<RoomAction, Permission>;
+}
+export interface RoomSnapshot {
+  contractVersion: typeof CONTRACT_VERSION; rulesVersion: string;
+  roomId: string; gameId: string | null; serverTime: number; viewVersion: number;
+  viewer: { userId: string; memberId: string; kind: MemberKind; subjectPlayerId: string | null; readOnly: boolean; isHost: boolean };
+  room: { code: string; phase: RoomPhase; config: RulesetConfig; publicChat: PublicChatMode; freeSpeech: boolean; requiredPlayers: number; hostMemberId: string | null; formalMembers: RoomMemberDTO[]; spectators: RoomMemberDTO[]; emptyDeadline: number | null };
+  public: PublicGameDTO | null; private: PrivateGameDTO | null;
+  /** 当前语音范围（Q-12）：对局内是对局频道（`gameId`），大厅与复盘是房间频道；无语音时为 null。 */
+  voice: RoomVoiceDTO | null;
+  capabilities: SnapshotCapabilities; windows: WindowDTO[]; tasks: TaskDTO[]; submissionState: SubmissionDTO[];
+  chat: { public: ChatMessageDTO[]; faction: ChatMessageDTO[] };
+}
+/**
+ * 语音范围与「谁在说话」的 uid 归属（Q-12）：仅用于按远端电平给座位 / 成员卡亮光环，
+ * 不含任何隐藏信息（uid 本就是频道内可见的编号）。
+ */
+export interface RoomVoiceDTO {
+  /** 频道名：对局频道 = `gameId`；大厅 / 复盘 = 房间频道（独立于任何一局）。 */
+  channel: string;
+  /**
+   * 频道 uid → **语音主体**：对局频道里是 `playerId`（座位卡比对），
+   * 房间频道里是 `memberId`（大厅 / 复盘成员卡比对，因为那时还没有 playerId）。
+   */
+  uids: Record<string, string>;
+}

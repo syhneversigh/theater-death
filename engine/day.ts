@@ -30,7 +30,7 @@ const VOTE_UNITS_PER_VOTE = 2;
 
 /** 投票资格：死者不可投；莱莱可翻牌且处一阶段禁投（持天理时票权同步冻结，R-44、R-16） */
 export function voteEligibility(state: GameState, playerId: string): VoteEligibility {
-  const player = state.players.find((item) => item.playerId === playerId);
+  const player = playerOf(state, playerId);
   if (player === undefined) {
     return 'unknown';
   }
@@ -90,7 +90,9 @@ export function currentTieSpeechSpeaker(state: GameState): string | null {
 }
 
 function playerOf(state: GameState, playerId: string): PlayerState | undefined {
-  return state.players.find((item) => item.playerId === playerId);
+  const player = state.players.find((item) => item.playerId === playerId);
+  if (player && state.preAnnouncementElection) return { ...player, life: state.night?.eligibleAtStart?.includes(playerId) ? 'alive' : 'dead', revealed: false, voteFrozen: false };
+  return player;
 }
 
 function seatOf(state: GameState, playerId: string): number {
@@ -102,13 +104,30 @@ function seatOf(state: GameState, playerId: string): number {
 }
 
 function aliveSorted(state: GameState): readonly PlayerState[] {
-  return [...state.players].filter((player) => player.life !== 'dead').sort((a, b) => a.seat - b.seat);
+  return state.players.map((p) => playerOf(state, p.playerId)!).filter((player) => player.life !== 'dead').sort((a, b) => a.seat - b.seat);
 }
 
 function eligibleVoters(state: GameState): readonly string[] {
   return aliveSorted(state)
     .filter((player) => voteEligibility(state, player.playerId) === 'ok')
     .map((player) => player.playerId);
+}
+
+/** 未退选的候选（R-42：候选不得投票，含平票重投时的平票者） */
+function activeCandidates(state: GameState): readonly string[] {
+  const election = state.day?.election;
+  return (election?.candidates ?? []).filter((id) => !(election?.withdrawn ?? []).includes(id));
+}
+
+/** 竞选投票人：除未退选候选外的有资格玩家 */
+function electionVoters(state: GameState): readonly string[] {
+  const candidates = new Set(activeCandidates(state));
+  return eligibleVoters(state).filter((playerId) => !candidates.has(playerId));
+}
+
+/** 竞选应投人数（服务端用于满员提前结算与快照展示） */
+export function electionVoterCount(state: GameState): number {
+  return electionVoters(state).length;
 }
 
 function buildSpeechOrder(
@@ -169,7 +188,7 @@ function requireStep(state: GameState, step: DayStep): DayValidationIssue | null
 }
 
 /** 卸任天理已死且尚未移交时建立移交待办（R-46） */
-function handoverAfterDeath(state: GameState, players: readonly PlayerState[]): HandoverState | null {
+function handoverAfterDeath(state: GameState, players: readonly PlayerState[], cause: 'night_death' | 'day_elimination' = 'night_death'): HandoverState | null {
   if (!state.ruleset.sheriff.enabled) {
     return null;
   }
@@ -179,7 +198,7 @@ function handoverAfterDeath(state: GameState, players: readonly PlayerState[]): 
   }
   const holder = players.find((player) => player.playerId === holderId);
   if (holder !== undefined && holder.life === 'dead') {
-    return { deadSheriffId: holderId, resolved: false, heirId: null };
+    return { deadSheriffId: holderId, resolved: false, heirId: null, cause, resumeStep: cause === 'night_death' ? 'speech_round' : 'settle' };
   }
   return null;
 }
@@ -211,7 +230,7 @@ function enterElectionOrSpeech(
   state: GameState,
   emitter: EventCollector,
 ): { step: DayStep; election: ElectionState | null } {
-  if (state.dayNumber === 1 && state.ruleset.sheriff.enabled) {
+  if (state.dayNumber === 1 && state.ruleset.sheriff.enabled && !state.firstDayElectionDone) {
     emitter.emit('election_started', { phase: 'signup' }, { kind: 'public' });
     return { step: 'election', election: makeElection(state) };
   }
@@ -249,9 +268,9 @@ export function beginDay(state: GameState): { state: GameState; events: GameEven
   }
   const emitter = emitterFor(state);
 
-  const handover = handoverAfterDeath(state, state.players);
+  const handover = state.preAnnouncementElection ? null : handoverAfterDeath(state, state.players);
   const firstNightDeaths =
-    state.dayNumber === 1 && state.night !== null ? state.night.deaths : ([] as readonly string[]);
+    !state.preAnnouncementElection && state.dayNumber === 1 && state.night !== null ? state.night.deaths.filter((id) => playerOf(state, id)?.life === 'dead') : ([] as readonly string[]);
 
   let step: DayStep;
   let lastWords: PacedQueue | null = null;
@@ -269,6 +288,9 @@ export function beginDay(state: GameState): { state: GameState; events: GameEven
       { scope: 'first_night', seat: seatOf(state, queue[0]) },
       { kind: 'public' },
     );
+  } else if (handover !== null) {
+    step = 'handover';
+    emitter.emit('sheriff_handover_started', { fromSeat: seatOf(state, handover.deadSheriffId) }, { kind: 'public' });
   } else {
     const next = enterElectionOrSpeech(state, emitter);
     step = next.step;
@@ -330,9 +352,13 @@ export function endLastWords(
       { kind: 'public' },
     );
   } else if (scope === 'first_night') {
-    const next = enterElectionOrSpeech(state, emitter);
-    step = next.step;
-    election = next.election;
+    if (day.handover !== null && !day.handover.resolved) {
+      step = enterHandoverOrSettle(state, day, emitter);
+    } else {
+      const next = enterElectionOrSpeech(state, emitter);
+      step = next.step;
+      election = next.election;
+    }
   } else {
     step = enterHandoverOrSettle(state, day, emitter);
   }
@@ -439,7 +465,7 @@ function finishElection(
     { winnerSeat: winnerId === null ? null : seatOf(state, winnerId), reason },
     { kind: 'public' },
   );
-  const next = enterSpeechRound(nextState, emitter);
+  const next = state.preAnnouncementElection ? { step: 'morning_announcement' as const } : enterSpeechRound(nextState, emitter);
   return {
     state: nextState,
     step: next.step,
@@ -536,9 +562,17 @@ export function advanceElectionSpeech(state: GameState): { state: GameState; eve
         emitter,
       );
     }
+    if (electionVoters(state).length === 0) {
+      const finished = finishElection(state, election, emitter, null, 'no_votes');
+      return result(
+        finished.state,
+        { ...day, step: finished.step, election: finished.election },
+        emitter,
+      );
+    }
     emitter.emit(
       'election_vote_started',
-      { round: 1, eligibleSeats: eligibleVoters(state).map((id) => seatOf(state, id)) },
+      { round: 1, eligibleSeats: electionVoters(state).map((id) => seatOf(state, id)) },
       { kind: 'public' },
     );
     updated = {
@@ -573,6 +607,9 @@ export function submitElectionVoteIssue(
   if (eligibility !== 'ok') {
     return issue(`vote_forbidden_${eligibility}`, '该玩家没有竞选投票资格');
   }
+  if (activeCandidates(state).includes(voterId)) {
+    return issue('vote_forbidden_candidate', '候选人不得投票');
+  }
   if (voterId in election.votes) {
     return issue('already_voted', '已经投过票');
   }
@@ -602,7 +639,7 @@ export function submitElectionVote(
   const votes = { ...election.votes, [voterId]: targetId };
   emitter.emit(
     'election_vote_progress',
-    { votedCount: Object.keys(votes).length, eligibleCount: eligibleVoters(state).length },
+    { votedCount: Object.keys(votes).length, eligibleCount: electionVoters(state).length },
     { kind: 'public' },
   );
   return result(state, { ...day, election: { ...election, votes } }, emitter);
@@ -687,7 +724,7 @@ export function settleElectionVote(state: GameState): { state: GameState; events
       'election_revote_started',
       {
         seats: topIds.map((id) => seatOf(state, id)).sort((a, b) => a - b),
-        eligibleSeats: eligibleVoters(state).map((id) => seatOf(state, id)),
+        eligibleSeats: electionVoters(state).map((id) => seatOf(state, id)),
       },
       { kind: 'public' },
     );
@@ -857,22 +894,65 @@ export function advanceSpeech(
     );
     updated = { ...day, speechRound: { ...round, index: nextIndex } };
   } else {
-    emitter.emit(
-      'day_vote_started',
-      { round: 1, eligibleSeats: eligibleVoters(state).map((id) => seatOf(state, id)) },
-      { kind: 'public' },
-    );
-    const ballot: BallotState = {
-      phase: 'vote',
-      round: 1,
-      votes: {},
-      tiedIds: [],
-      tieSpeechIndex: 0,
-      eliminatedId: null,
-    };
-    updated = { ...day, step: 'vote', speechRound: { ...round, index: nextIndex }, ballot };
+    updated = enterFreeSpeechOrVote(state, day, emitter, { ...round, index: nextIndex });
   }
   return result(state, updated, emitter);
+}
+
+/** 房主开启（规则集带正数 freeSpeech）时返回该阶段秒数，否则 null。 */
+export function freeSpeechSeconds(state: GameState): number | null {
+  const seconds = state.ruleset.timersSeconds.freeSpeech;
+  return typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
+/** 进入放逐投票：公示票型窗口并建立第一轮票箱（发言轮 / 自由发言结束后共用）。 */
+function enterDayVote(state: GameState, day: DayContext, emitter: EventCollector, round: SpeechRoundState | null): DayContext {
+  emitter.emit(
+    'day_vote_started',
+    { round: 1, eligibleSeats: eligibleVoters(state).map((id) => seatOf(state, id)) },
+    { kind: 'public' },
+  );
+  const ballot: BallotState = {
+    phase: 'vote',
+    round: 1,
+    votes: {},
+    tiedIds: [],
+    tieSpeechIndex: 0,
+    eliminatedId: null,
+  };
+  return { ...day, step: 'vote', speechRound: round, ballot };
+}
+
+/** 发言轮结束后的分流：房主开启且当天未走过 → 自由发言（存活玩家可开麦），否则直接放逐投票。 */
+function enterFreeSpeechOrVote(state: GameState, day: DayContext, emitter: EventCollector, round: SpeechRoundState): DayContext {
+  if (freeSpeechSeconds(state) !== null && day.freeSpeechDone !== true) {
+    emitter.emit('free_speech_started', { seconds: freeSpeechSeconds(state) }, { kind: 'public' });
+    return { ...day, step: 'free_speech', speechRound: round, freeSpeechDone: true };
+  }
+  return enterDayVote(state, day, emitter, round);
+}
+
+export function freeSpeechIssue(state: GameState): DayValidationIssue | null {
+  const stepIssue = requireStep(state, 'free_speech');
+  if (stepIssue !== null) {
+    return stepIssue;
+  }
+  if (freeSpeechSeconds(state) === null) {
+    return issue('free_speech_disabled', '本局未开启白天自由发言');
+  }
+  return null;
+}
+
+/** 自由发言窗口截止：进入放逐投票。 */
+export function advanceFreeSpeech(state: GameState): { state: GameState; events: GameEvent[] } {
+  const advanceIssue = freeSpeechIssue(state);
+  if (advanceIssue !== null) {
+    throw new Error(`推进自由发言失败：${advanceIssue.message}`);
+  }
+  const day = requireDay(state);
+  const emitter = emitterFor(state);
+  emitter.emit('free_speech_finished', {}, { kind: 'public' });
+  return result(state, enterDayVote(state, day, emitter, day.speechRound), emitter);
 }
 
 export function submitDayVoteIssue(
@@ -995,9 +1075,24 @@ export function settleDayVote(state: GameState): { state: GameState; events: Gam
     );
     emitter.emit('elimination_announced', { seat: seatOf(state, eliminatedId) }, { kind: 'public' });
 
+    if (state.ruleset.version === '2.0') {
+      const revealed = applyReveals(players, emitter);
+      players = revealed.players;
+      if (revealed.researcherRevealed) announceResearcherCount(state, players, emitter);
+      const transition = applyStageTransition(state, players, detectStageTrigger(players), emitter);
+      players = transition.players;
+      state = { ...state, players, stage: transition.stage, factionRoom: transition.factionRoom };
+      const win = checkVictory(state);
+      if (win !== null) {
+        emitter.emit('game_ended', { winner: win.winner, reason: win.reason, dayNumber: win.dayNumber }, { kind: 'public' });
+        const { events, eventSeq } = emitter.result();
+        return { state: { ...state, day: null, phase: 'ended', win, eventSeq }, events };
+      }
+    }
+
     const dayWithHandover: DayContext = {
       ...day,
-      handover: handoverAfterDeath(state, players),
+      handover: handoverAfterDeath(state, players, 'day_elimination'),
     };
     const elimination = afterElimination(state, dayWithHandover, eliminatedId, emitter);
     updatedDay = {
@@ -1195,9 +1290,10 @@ function performHandover(
   };
   const updated: DayContext = {
     ...day,
-    step: 'settle',
+    step: handover.resumeStep ?? 'settle',
     handover: { ...handover, resolved: true, heirId: targetId },
   };
+  if (updated.step === 'speech_round') enterSpeechRound(nextState, emitter);
   return result(nextState, updated, emitter);
 }
 

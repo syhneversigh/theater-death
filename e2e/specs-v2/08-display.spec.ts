@@ -1,0 +1,338 @@
+import { expect, test, type Page } from '@playwright/test';
+import { revealHudActions } from '../helpers-v2/rooms.ts';
+import { alivePlayers, loadGameFixture, loadReviewDocument, loadReviewFixture, pushFixture, resizeSeats, taskFixture, type GameHarnessFixture } from '../helpers-v2/game.ts';
+
+async function mountPlaying(page: Page, fixture: GameHarnessFixture) {
+  let current = fixture;
+  await page.route('**/__game-fixture', async route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(current) }));
+  await page.goto('/game-test.html');
+  await expect(page.getByRole('heading', { name: /夜幕降临|晨间公告/ })).toBeVisible();
+  return { setFixture: async (next: GameHarnessFixture) => { current = next; await pushFixture(page, next); } };
+}
+
+async function mountReview(page: Page, fixture = loadReviewFixture()) {
+  let current = fixture;
+  await page.route('**/__game-fixture', async route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(current) }));
+  await page.route('**/api/v2/rooms/*/review', async route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(loadReviewDocument()) }));
+  await page.goto('/game-test.html');
+  await expect(page.getByRole('heading', { name: '演出落幕' })).toBeVisible();
+  return { setFixture: async (next: GameHarnessFixture) => { current = next; await pushFixture(page, next); } };
+}
+
+async function openSettings(page: Page) {
+  await revealHudActions(page); await page.getByRole('button', { name: '导航' }).click();
+  await page.getByRole('dialog', { name: '剧院导航' }).getByRole('button', { name: '显示设置' }).click();
+  return page.getByRole('dialog', { name: '显示设置' });
+}
+
+async function expectNoOverflow(page: Page) {
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+}
+
+async function expectActionClearOfSeatsAndTools(page: Page) {
+  await expect.poll(async () => page.evaluate(() => {
+      const card = document.querySelector('.stage-action-slot')?.getBoundingClientRect();
+      if (!card || card.width <= 0 || card.height <= 0) return 'action card is not measurable';
+      for (const element of document.querySelectorAll('.seat-main, .seat-tools, .seat-count, .badge-strip')) {
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        if (card.left - 1 < rect.right && card.right + 1 > rect.left && card.top - 1 < rect.bottom && card.bottom + 1 > rect.top) {
+          return `${element.className}: ${JSON.stringify({ card: { left: card.left, top: card.top, right: card.right, bottom: card.bottom }, rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom } })}`;
+        }
+      }
+      return null;
+    }), { timeout: 5_000 }).toBeNull();
+}
+
+/** 竖屏半环（601–900px）：所有座位互不重叠（几何由 stage-layout 单测锁定，这里验证真实渲染）。 */
+async function expectArcSeatsClear(page: Page) {
+  await expect.poll(async () => page.evaluate(() => {
+    const seats = [...document.querySelectorAll('.stage-seat')].map(element => element.getBoundingClientRect());
+    for (let a = 0; a < seats.length; a += 1) {
+      for (let b = a + 1; b < seats.length; b += 1) {
+        const first = seats[a]!, second = seats[b]!;
+        if (first.left - 1 < second.right && first.right + 1 > second.left && first.top - 1 < second.bottom && first.bottom + 1 > second.top) {
+          return `seats ${a}/${b} overlap: ${JSON.stringify([first, second])}`;
+        }
+      }
+    }
+    return null;
+  }), { timeout: 5_000 }).toBeNull();
+}
+
+function deathFixture(base: GameHarnessFixture, type: 'deaths_announced' | 'elimination_announced', cursor: number): GameHarnessFixture {
+  const next = structuredClone(base);
+  next.view.public!.events = [...next.view.public!.events, {
+    cursor, type, dayNumber: 1, stage: 1,
+    payload: type === 'deaths_announced' ? { seats: [1] } : { seat: 2 },
+  }];
+  next.view.public!.seats.forEach(seat => { if (seat.seat === (type === 'deaths_announced' ? 1 : 2)) seat.alive = false; });
+  return next;
+}
+
+test('显示设置通过UI更新三项非敏感偏好，实际缩放/动画状态变化并在reload后保留', async ({ page }) => {
+  await mountPlaying(page, loadGameFixture());
+  await page.evaluate(() => localStorage.clear());
+  await page.reload();
+  const dialog = await openSettings(page);
+  const deathEffects = dialog.getByRole('checkbox', { name: '死亡特效', exact: true });
+  await dialog.getByLabel('动画偏好').selectOption('full');
+  await deathEffects.uncheck();
+  await dialog.getByLabel('界面缩放').selectOption('90');
+  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).zoom)).toBe('0.9');
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.reducedMotion)).toBe('false');
+  await dialog.getByLabel('界面缩放').selectOption('110');
+  await deathEffects.check();
+  await dialog.getByLabel('动画偏好').selectOption('reduced');
+  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).zoom)).toBe('1.1');
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.reducedMotion)).toBe('true');
+  await dialog.getByLabel('动画偏好').selectOption('system');
+  const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('theater-death-display-v1') ?? '{}') as Record<string, unknown>);
+  expect(Object.keys(stored).sort()).toEqual(['attentionSound', 'autoMic', 'deathEffects', 'motion', 'scale', 'stageBrightness', 'theme', 'voiceInput', 'voiceLevels', 'voiceMuted', 'voiceOutput']);
+  expect(stored).toMatchObject({ deathEffects: true, motion: 'system', scale: 110 });
+
+  await page.getByRole('button', { name: '关闭' }).click();
+  await page.reload();
+  const afterReload = await openSettings(page);
+  await expect(afterReload.getByLabel('动画偏好')).toHaveValue('system');
+  await expect(afterReload.getByLabel('界面缩放')).toHaveValue('110');
+  await expect(afterReload.getByRole('checkbox', { name: '死亡特效', exact: true })).toBeChecked();
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.getByRole('button', { name: '关闭' }).click();
+  await page.reload();
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.reducedMotion)).toBe('true');
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.reload();
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.reducedMotion)).toBe('false');
+});
+
+test('公开新死讯才播放粒子：不重播历史，减少动画与关闭特效仍保留公告', async ({ page }) => {
+  const base = loadGameFixture('night-door-full.json');
+  const mounted = await mountPlaying(page, base);
+  await expect(page.locator('.death-notice')).toHaveCount(0);
+  const firstDeath = deathFixture(base, 'deaths_announced', 3);
+  await mounted.setFixture(firstDeath);
+  await expect(page.locator('.death-notice')).toContainText('1号已死亡');
+  expect(await page.locator('.death-notice').evaluate(element => getComputedStyle(element).pointerEvents)).toBe('none');
+  const records = page.getByRole('tab', { name: '记录' });
+  await records.click();
+  await expect(page.getByRole('tabpanel', { name: '记录' })).toContainText('晨间死讯');
+  await mounted.setFixture(structuredClone(firstDeath));
+  await expect(page.locator('.death-notice')).toHaveCount(0, { timeout: 4_000 });
+
+  const offline = structuredClone(firstDeath); offline.online = false;
+  await mounted.setFixture(offline);
+  const online = structuredClone(firstDeath); online.online = true;
+  await mounted.setFixture(online);
+  await expect(page.locator('.death-notice')).toHaveCount(0);
+
+  const privateOnly = structuredClone(firstDeath);
+  privateOnly.view.private!.self.life = 'dead';
+  privateOnly.view.private!.events.push({ cursor: 4, type: 'night_deaths_confirmed', dayNumber: 1, stage: 1, payload: { deaths: [{ playerId: privateOnly.view.viewer.subjectPlayerId }] } });
+  await mounted.setFixture(privateOnly);
+  await expect(page.locator('.death-notice')).toHaveCount(0);
+
+  const settings = await openSettings(page);
+  await settings.getByRole('checkbox', { name: '死亡特效', exact: true }).uncheck();
+  await page.getByRole('button', { name: '关闭' }).click();
+  const disabledDeath = deathFixture(privateOnly, 'elimination_announced', 5);
+  await mounted.setFixture(disabledDeath);
+  await expect(page.locator('.death-notice')).toContainText('2号已死亡');
+  await expect(page.locator('.death-particles')).toHaveCount(0);
+  await expect(page.locator('.seat-death-mark')).toHaveCount(0);
+  const reducedSettings = await openSettings(page);
+  await reducedSettings.getByRole('checkbox', { name: '死亡特效', exact: true }).check();
+  await reducedSettings.getByLabel('动画偏好').selectOption('reduced');
+  await page.getByRole('button', { name: '关闭' }).click();
+  await mounted.setFixture(deathFixture(disabledDeath, 'deaths_announced', 6));
+  await expect(page.locator('.death-notice')).toContainText('1号');
+  await expect(page.locator('.death-particles')).toHaveCount(0);
+  await expect(page.locator('[data-death-seat="1"] .seat-death-mark')).toBeVisible();
+});
+
+test('320/390/844/1440视口与5/13/26/64席位无横向溢出，长账号可读且草稿跨resize保留', async ({ page }, testInfo) => {
+  const base = loadGameFixture('night-door-full.json');
+  const mounted = await mountPlaying(page, base);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const stageActions = page.getByRole('region', { name: '舞台行动', exact: true });
+  await expect(stageActions).toBeVisible();
+  await expect(stageActions).toContainText('选择守护目标');
+  await expect(stageActions).toContainText(/00:\d{2}/);
+  await expect(stageActions.getByTestId('stage-submit')).toHaveAccessibleName(/确认空守|确认守护/);
+  await expect(page.locator('.mobile-action-bar')).toHaveCount(0);
+
+  const firstSeat = base.view.public!.seats.find(s => s.seat === 1)!;
+  const firstTarget = page.getByRole('button', { name: `1号 ${firstSeat.nickname}，可选目标` });
+  await firstTarget.click();
+  const selectedSummary = page.locator('.selection-summary');
+  await expect(selectedSummary).toContainText(`1号 ${firstSeat.nickname}`);
+  const settings = await openSettings(page);
+  await settings.getByLabel('界面缩放').selectOption('110');
+  await page.getByRole('button', { name: '关闭' }).click();
+
+  // Sequential viewport resizing across key breakpoints
+  // 601–900px 均为半环：断言实际布局与座位间距，退出半环时等待 resize 布局更新。
+  const sizes: { width: number; height: number; cols?: number; arc?: boolean }[] = [
+    { width: 1440, height: 900, cols: 0 },
+    { width: 1280, height: 800, cols: 0 },
+    { width: 1240, height: 800, cols: 0 },
+    { width: 1181, height: 900, cols: 0 },
+    { width: 1180, height: 800, cols: 4 },
+    { width: 681, height: 800, arc: true },
+    { width: 680, height: 750, arc: true },
+    { width: 601, height: 900, arc: true },
+    { width: 600, height: 900, cols: 3 },
+    { width: 390, height: 844, cols: 3 },
+    { width: 320, height: 740, cols: 2 },
+    { width: 844, height: 390, arc: true },
+    { width: 1440, height: 900, cols: 0 },
+  ];
+
+  for (const size of sizes) {
+    await page.setViewportSize({ width: size.width, height: size.height });
+    await expectNoOverflow(page);
+    await expect(page.getByRole('heading', { name: /夜幕降临|晨间公告/ })).toBeVisible();
+    await expect(selectedSummary).toContainText(`1号 ${firstSeat.nickname}`);
+    await expect(page.getByRole('region', { name: '舞台行动', exact: true })).toHaveCount(1);
+    await expectActionClearOfSeatsAndTools(page);
+    if (size.arc) {
+      await expect(page.locator('.theater-stage')).toHaveClass(/theater-stage--arc/);
+      await expectArcSeatsClear(page);
+    } else if ((size.cols ?? 0) > 0) {
+      await expect(page.locator('.theater-stage')).not.toHaveClass(/theater-stage--arc/);
+      await expect.poll(() => page.locator('.stage-seats').evaluate(el => window.getComputedStyle(el).gridTemplateColumns.split(' ').length)).toBe(size.cols);
+    }
+  }
+
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.screenshot({ path: `/results/display-desktop-${testInfo.project.name}.png`, fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: `/results/display-mobile-${testInfo.project.name}.png`, fullPage: true });
+
+  for (const count of [5, 13, 26, 64]) {
+    const resized = resizeSeats(base.view, count);
+    for (const size of [{ width: 390, height: 844 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(size);
+      await mounted.setFixture({ ...base, view: resized });
+      await expect(page.locator('.stage-seat')).toHaveCount(count);
+      await expectNoOverflow(page);
+    }
+  }
+
+  const longAccount = structuredClone(base);
+  longAccount.view.public!.seats[0]!.nickname = 'A'.repeat(32);
+  await mounted.setFixture(longAccount);
+  const detail = page.getByRole('button', { name: '查看1号玩家信息' });
+  await detail.click();
+  await expect(page.getByRole('dialog')).toContainText('A'.repeat(32));
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (document.activeElement as HTMLElement | null)?.getAttribute('aria-label'))).toBe('查看1号玩家信息');
+});
+
+async function ringWithinFrames(page: Page, frames: number): Promise<boolean> {
+  return page.evaluate(async count => {
+    for (let index = 0; index < count; index += 1) {
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    }
+    return document.querySelector('.theater-stage')?.classList.contains('theater-stage--ring') ?? false;
+  }, frames);
+}
+
+test('窄屏往返与高卡片回退后，加宽都在数帧内确定性恢复环形布局', async ({ page }) => {
+  const base = loadGameFixture('night-door-full.json');
+  const mounted = await mountPlaying(page, base);
+  const stage = page.locator('.theater-stage');
+  const isRing = () => stage.evaluate(element => element.classList.contains('theater-stage--ring'));
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(isRing).toBe(false);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  expect(await ringWithinFrames(page, 4)).toBe(true);
+  await expectActionClearOfSeatsAndTools(page);
+
+  await page.setViewportSize({ width: 1181, height: 900 });
+  expect(await ringWithinFrames(page, 4)).toBe(true);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  expect(await ringWithinFrames(page, 4)).toBe(true);
+  await expectActionClearOfSeatsAndTools(page);
+
+  const resized = resizeSeats(base.view, 13);
+  const tall = taskFixture(resized, 'SUBMIT_LAIKE', {
+    playerIds: alivePlayers(resized).slice(0, 6), maxTargets: 3, allowRepeated: true, canSkip: true, forbiddenPairs: [],
+  }, 'fixture:tall');
+  tall.view.submissionState = [{
+    action: 'SUBMIT_LAIKE', windowInstanceId: 'fixture:tall',
+    targets: [resized.public!.seats[0]!.playerId, resized.public!.seats[1]!.playerId],
+    revision: null, direction: null, requestId: 'fixture-tall-req', acceptedAt: tall.view.serverTime - 1000,
+  }];
+  await mounted.setFixture(tall);
+  await page.setViewportSize({ width: 1181, height: 900 });
+  await expect.poll(isRing).toBe(false);
+  await expectActionClearOfSeatsAndTools(page);
+  await page.setViewportSize({ width: 1600, height: 900 });
+  expect(await ringWithinFrames(page, 4)).toBe(true);
+  await expectActionClearOfSeatsAndTools(page);
+});
+
+test('模拟软键盘缩小视口时聊天输入可见且焦点不被抢走，舞台行动不遮挡聊天', async ({ page }) => {
+  const fixture = loadGameFixture('night-door-full.json');
+  fixture.view.capabilities.canPostPublic = true;
+  const mounted = await mountPlaying(page, fixture);
+  await page.getByRole('tab', { name: '公屏' }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  const input = page.getByLabel('公屏消息');
+  await input.focus();
+  await page.setViewportSize({ width: 390, height: 500 });
+  await expect(input).toBeFocused();
+  await expect(page.locator('.mobile-action-bar')).toHaveCount(0);
+  const bounds = await input.boundingBox();
+  const sendBounds = await page.getByRole('button', { name: '发送公屏消息' }).boundingBox();
+  expect(bounds).not.toBeNull();
+  expect(sendBounds).not.toBeNull();
+  expect(bounds!.y).toBeGreaterThanOrEqual(0);
+  expect(sendBounds!.y).toBeGreaterThanOrEqual(0);
+  expect(await page.evaluate(() => document.documentElement.dataset.keyboardOpen)).toBe('true');
+  await expect(page.getByRole('region', { name: '舞台行动', exact: true })).toBeVisible();
+  void mounted;
+});
+
+test('游戏与复盘tab支持Arrow/Home/End，Escape关闭弹层，规则章节单标题并可返回', async ({ page }) => {
+  await mountPlaying(page, loadGameFixture('night-door-full.json'));
+  const infoTabs = page.getByRole('tablist', { name: '对局信息' }).getByRole('tab');
+  await infoTabs.nth(0).focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(infoTabs.nth(1)).toBeFocused();
+  await expect(infoTabs.nth(1)).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Home');
+  await expect(infoTabs.nth(0)).toBeFocused();
+  await page.keyboard.press('End');
+  await expect(infoTabs.nth(3)).toBeFocused();
+  await expect(infoTabs.nth(3)).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('button', { name: '打开完整规则' }).click();
+  const rules = page.getByRole('dialog', { name: /完整规则/ });
+  const initialTitle = await rules.locator('article h2').textContent();
+  await expect(rules.locator('article h2')).toHaveCount(1);
+  await rules.getByLabel('规则章节').selectOption({ index: 1 });
+  await expect(rules.getByRole('button', { name: '返回上一章节' })).toBeVisible();
+  await rules.getByRole('button', { name: '返回上一章节' }).click();
+  await expect(rules.locator('article h2')).toHaveText(initialTitle ?? '');
+  await expect(rules.locator('.modal-game-context')).toHaveCSS('position', 'sticky');
+  await rules.evaluate(dialog => { dialog.scrollTop = 400; dialog.dispatchEvent(new Event('scroll', { bubbles: true })); });
+  const contextTop = await rules.locator('.modal-game-context').evaluate(element => element.getBoundingClientRect().top);
+  const dialogTop = await rules.evaluate(element => element.getBoundingClientRect().top);
+  expect(contextTop).toBeGreaterThanOrEqual(dialogTop - 2);
+  await page.keyboard.press('Escape');
+  await expect(rules).toHaveCount(0);
+
+  await mountReview(page);
+  const reviewTabs = page.getByRole('tablist', { name: '复盘内容' }).getByRole('tab');
+  await reviewTabs.nth(0).focus();
+  await page.keyboard.press('End');
+  await expect(reviewTabs.nth(3)).toBeFocused();
+  await expect(reviewTabs.nth(3)).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Home');
+  await expect(reviewTabs.nth(0)).toBeFocused();
+  await page.keyboard.press('ArrowRight');
+  await expect(reviewTabs.nth(1)).toBeFocused();
+});

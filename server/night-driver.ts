@@ -1,5 +1,7 @@
 import type { GameEvent } from '../engine/events.ts';
 import {
+  descenderCheckIssue,
+  rescueSelectionIssue,
   resolveAttackPhase,
   resolveDescenderCheck,
   resolveNightEnd,
@@ -14,18 +16,22 @@ import {
   createProposalState,
   editProposal,
   lockedVersion,
+  resolvedProposal,
   type ProposalState,
 } from '../engine/proposal.ts';
 import type { GameState, PlayerState } from '../engine/types.ts';
 import type { Clock, ClockHandle } from './clock.ts';
 import type { GameCommand, NightCommand } from './commands.ts';
 import type { NightValidationIssue } from '../engine/night.ts';
+import { windowIssue } from './windows.ts';
 
 export type NightWindowId = 'guard' | 'faction' | 'laike' | 'check' | 'rescue' | 'revive';
 
 export interface LiveWindow {
   readonly id: string;
   readonly closesAt: number;
+  readonly instanceId?: string;
+  readonly type?: string;
 }
 
 /** R-47 阵营协商的本人视角：同池成员可见草稿版本、目标与确认进度 */
@@ -36,6 +42,11 @@ export interface ProposalView {
   readonly targetPlayerIds: readonly string[];
   readonly confirmedBy: readonly string[];
   readonly locked: boolean;
+  readonly effective: {
+    readonly revision: number | null;
+    readonly targetPlayerIds: readonly string[];
+    readonly basis: 'unanimous' | 'latest_legal' | 'empty';
+  };
 }
 
 export interface NightStepResult {
@@ -53,6 +64,8 @@ export interface NightDriver {
   start(state: GameState): void;
   submit(command: GameCommand): SubmitResult;
   windows(): readonly LiveWindow[];
+  /** 公开夜幕时钟：当前夜间段的截止时间（不暴露段名/段数，见"公开时钟与角色窗口分开设计"） */
+  nightDeadline(): number | null;
   proposalState(playerId: string): ProposalView | null;
   snapshot(): GameState | null;
   done(): boolean;
@@ -69,6 +82,7 @@ interface PoolRef {
 }
 
 export function createNightDriver(options: {
+  readonly strictWindows?: boolean;
   readonly clock: Clock;
   readonly onStep: (result: NightStepResult) => void;
   readonly onComplete?: (state: GameState) => void;
@@ -94,6 +108,12 @@ export function createNightDriver(options: {
   let jointProposal = createProposalState();
 
   const handles: ClockHandle[] = [];
+
+  function allWindows(): LiveWindow[] {
+    if (!state || phase === 'idle' || phase === 'done') return [];
+    const pairs: [string, number][] = phase === 'segment1' ? [['guard', guardClosesAt], ['faction', factionClosesAt], ['laike', laikeClosesAt]] : phase === 'segment2' ? [['check', checkClosesAt], ...(current().nightStage === 1 ? [['rescue', rescueClosesAt] as [string, number]] : [])] : [['revive', reviveClosesAt]];
+    return pairs.map(([id, closesAt]) => ({ id, closesAt, ...(options.strictWindows ? { type: id, instanceId: `${state!.gameId}:night:${state!.dayNumber}:${id}` } : {}) }));
+  }
 
   function accepted(): SubmitResult {
     return { accepted: true, code: null, message: null };
@@ -193,8 +213,8 @@ export function createNightDriver(options: {
   function assembleAttackInput(): AttackPhaseInput {
     const game = current();
     if (game.nightStage === 1) {
-      const deathLocked = lockedVersion(deathProposal, livingIds('death'));
-      const spiritLocked = lockedVersion(spiritProposal, livingIds('spirit'));
+      const deathLocked = resolvedProposal(deathProposal, livingIds('death'), game.ruleset.teamConfirm === 'unanimous_or_latest');
+      const spiritLocked = resolvedProposal(spiritProposal, livingIds('spirit'), game.ruleset.teamConfirm === 'unanimous_or_latest');
       return {
         guardTargetIds: guardSubmission?.targetIds ?? [],
         stage1DeathTargetIds: deathLocked?.targetPlayerIds ?? [],
@@ -203,7 +223,7 @@ export function createNightDriver(options: {
         laikeTargetId: laikeSubmission?.targetId ?? null,
       };
     }
-    const jointLocked = lockedVersion(jointProposal, [...livingIds('death'), ...livingIds('spirit')]);
+    const jointLocked = resolvedProposal(jointProposal, [...livingIds('death'), ...livingIds('spirit')], game.ruleset.teamConfirm === 'unanimous_or_latest');
     return {
       guardTargetIds: guardSubmission?.targetIds ?? [],
       stage1DeathTargetIds: [],
@@ -287,7 +307,9 @@ export function createNightDriver(options: {
   }
 
   function finishNight(): void {
-    step(resolveMorning(current()));
+    if (current().ruleset.version === '2.0' && current().dayNumber === 1 && current().ruleset.sheriff.enabled) {
+      step({ state: { ...current(), phase: 'day', preAnnouncementElection: true }, events: [] });
+    } else step(resolveMorning(current()));
     phase = 'done';
     onComplete?.(current());
   }
@@ -358,7 +380,19 @@ export function createNightDriver(options: {
     if (issues.length > 0) {
       return rejectedIssue(issues[0]);
     }
-    pool.set(editProposal(pool.get(), pool.memberIds, command.playerId, command.targets));
+    const before = pool.get();
+    if (command.confirmSelf) {
+      const currentRevision = before.versions.at(-1)?.revision ?? 0;
+      if (currentRevision !== command.expectedRevision) {
+        return rejected('proposal_changed', '团队方案已经更新，请核对后重试');
+      }
+      const edited = editProposal(before, pool.memberIds, command.playerId, command.targets);
+      const revision = edited.versions.at(-1)!.revision;
+      const confirmed = confirmProposal(edited, pool.memberIds, command.playerId, revision);
+      pool.set(confirmed);
+    } else {
+      pool.set(editProposal(before, pool.memberIds, command.playerId, command.targets));
+    }
     return accepted();
   }
 
@@ -406,14 +440,8 @@ export function createNightDriver(options: {
 
   function descenderCheckIssueLocal(targetId: string): NightValidationIssue | null {
     const game = current();
-    const target = game.players.find((player) => player.playerId === targetId);
-    if (target === undefined) {
-      return { code: 'unknown_target', message: `查验目标 ${targetId} 不存在` };
-    }
-    if (target.life === 'dead') {
-      return { code: 'target_dead', message: '查验目标已死亡' };
-    }
-    return null;
+    const actor = game.players.find((p) => p.roleId === 'descender');
+    return descenderCheckIssue(game, actor?.playerId ?? '', targetId);
   }
 
   function submitRescue(command: Extract<NightCommand, { type: 'SUBMIT_RESCUE' }>): SubmitResult {
@@ -442,21 +470,7 @@ export function createNightDriver(options: {
   }
 
   function rescueIssueLocal(targetId: string): NightValidationIssue | null {
-    const game = current();
-    const water = game.players.find((player) => player.roleId === 'water');
-    if (water === undefined || water.life === 'dead') {
-      return { code: 'water_unavailable', message: '水妖不存在或已死亡' };
-    }
-    if (water.abilities.waterRescueUsed) {
-      return { code: 'rescue_used', message: '还魂曲整局限一次，已经使用' };
-    }
-    if (targetId === water.playerId) {
-      return { code: 'rescue_self_forbidden', message: '还魂曲不能救自己' };
-    }
-    if (game.night === null || !game.night.dyingSet.includes(targetId)) {
-      return { code: 'target_not_dying', message: '目标不在本夜濒死名单内' };
-    }
-    return null;
+    return rescueSelectionIssue(current(), targetId);
   }
 
   function submitRevive(command: Extract<NightCommand, { type: 'SUBMIT_REVIVE' }>): SubmitResult {
@@ -493,6 +507,10 @@ export function createNightDriver(options: {
       openSegment1();
     },
     submit(command) {
+      if (options.strictWindows) {
+        const issue = windowIssue(command, allWindows(), clock.now());
+        if (issue) return issue;
+      }
       if (state === null) {
         return rejected('night_not_started', '夜晚尚未开始');
       }
@@ -527,44 +545,26 @@ export function createNightDriver(options: {
       const proposal = pool.get();
       const latest =
         proposal.versions.length > 0 ? proposal.versions[proposal.versions.length - 1] : null;
+      const locked = lockedVersion(proposal, pool.memberIds);
+      const effective = resolvedProposal(proposal, pool.memberIds, state!.ruleset.teamConfirm === 'unanimous_or_latest');
       return {
         pool: pool.kind,
         activeMemberIds: pool.memberIds,
         revision: latest?.revision ?? 0,
         targetPlayerIds: latest?.targetPlayerIds ?? [],
         confirmedBy: latest?.confirmedBy ?? [],
-        locked: lockedVersion(proposal, pool.memberIds) !== null,
+        locked: locked !== null,
+        effective: { revision: effective?.revision ?? null, targetPlayerIds: effective?.targetPlayerIds ?? [], basis: locked ? 'unanimous' : effective ? 'latest_legal' : 'empty' },
       };
     },
     windows() {
-      if (state === null || phase === 'idle' || phase === 'done') {
-        return [];
-      }
-      const now = clock.now();
-      if (phase === 'segment1') {
-        const list: LiveWindow[] = [];
-        if (now < guardClosesAt) {
-          list.push({ id: 'guard', closesAt: guardClosesAt });
-        }
-        if (now < factionClosesAt) {
-          list.push({ id: 'faction', closesAt: factionClosesAt });
-        }
-        if (now < laikeClosesAt) {
-          list.push({ id: 'laike', closesAt: laikeClosesAt });
-        }
-        return list;
-      }
-      if (phase === 'segment2') {
-        const list: LiveWindow[] = [];
-        if (now < checkClosesAt) {
-          list.push({ id: 'check', closesAt: checkClosesAt });
-        }
-        if (current().nightStage === 1 && now < rescueClosesAt) {
-          list.push({ id: 'rescue', closesAt: rescueClosesAt });
-        }
-        return list;
-      }
-      return [{ id: 'revive', closesAt: reviveClosesAt }];
+      return allWindows().filter((w) => clock.now() < w.closesAt);
+    },
+    nightDeadline() {
+      if (state === null || phase === 'idle' || phase === 'done') return null;
+      if (phase === 'segment1') return factionClosesAt;
+      if (phase === 'segment2') return checkClosesAt;
+      return reviveClosesAt;
     },
     snapshot() {
       return state;

@@ -13,6 +13,8 @@ export type NightCommand =
       readonly type: 'EDIT_PROPOSAL';
       readonly playerId: string;
       readonly targets: readonly string[];
+      readonly confirmSelf?: true;
+      readonly expectedRevision?: number;
     }
   | {
       readonly type: 'CONFIRM_PROPOSAL';
@@ -38,6 +40,7 @@ export type NightCommand =
 export type NightCommandType = NightCommand['type'];
 
 export type DayCommand =
+  | { readonly type: 'START_SPEECH'; readonly playerId: string }
   | {
       readonly type: 'END_LAST_WORDS';
       readonly playerId: string;
@@ -86,6 +89,6 @@ export type DayCommand =
 
 export type DayCommandType = DayCommand['type'];
 
-export type GameCommand = NightCommand | DayCommand;
+export type GameCommand = (NightCommand | DayCommand) & { readonly windowInstanceId?: string };
 
 export type GameCommandType = GameCommand['type'];

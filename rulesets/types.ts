@@ -28,6 +28,10 @@ export type EliminationGroup = 'deity' | 'civilian' | 'researcher' | 'none';
 export type RulesetMode = 'formal' | 'experimental';
 
 export interface TimersSeconds {
+  readonly speechPrepare?: number;
+  readonly speechOrder?: number;
+  /** 白天「自由发言」阶段时长（仅 2.0 预设且房主开启时存在；1.1 不带该键） */
+  readonly freeSpeech?: number;
   readonly faction: number;
   readonly ability: number;
   readonly vote: number;
@@ -63,7 +67,7 @@ export interface RulesetConfig {
   readonly timersSeconds: TimersSeconds;
   readonly sheriff: SheriffConfig;
   readonly lastWords: LastWordsConfig;
-  readonly teamConfirm: 'unanimous_by_revision';
+  readonly teamConfirm: 'unanimous_by_revision' | 'unanimous_or_latest';
   readonly duplicateTargetPolicy: 'allow' | 'forbid';
   readonly attackOrder: 'seat_asc_then_source_priority';
   readonly researcherAnnouncement: ResearcherAnnouncementConfig;

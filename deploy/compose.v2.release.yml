@@ -1,0 +1,22 @@
+name: theater-death-v2-candidate
+services:
+  app:
+    image: ${V2_IMAGE:?Set V2_IMAGE to the verified local candidate tag}
+    restart: unless-stopped
+    ports: ["127.0.0.1:3001:3000"]
+    cpus: 2
+    mem_limit: 4g
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
+      DATA_DIR: /app/data-v2
+      PORT: 3000
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      VOICE_ENABLED: ${VOICE_ENABLED:-false}
+      AGORA_APP_ID: ${AGORA_APP_ID:-}
+      AGORA_APP_CERTIFICATE: ${AGORA_APP_CERTIFICATE:-}
+      AGORA_CUSTOMER_KEY: ${AGORA_CUSTOMER_KEY:-}
+      AGORA_CUSTOMER_SECRET: ${AGORA_CUSTOMER_SECRET:-}
+      AGORA_REST_BASE_URL: ${AGORA_REST_BASE_URL:-}
+    volumes:
+      - ../data-v2:/app/data-v2
